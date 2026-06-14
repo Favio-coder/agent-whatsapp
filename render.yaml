@@ -2,12 +2,12 @@ services:
   - type: web
     name: asistente-comuneros
     runtime: python
-    repo: https://github.com/TU_USUARIO/TU_REPO   # <-- Cambia esto
+    repo: https://github.com/Favio-coder/agent-whatsapp.git
     branch: main
     plan: free
     envVars:
       - key: GEMINI_API_KEY
-        sync: false          # Se ingresa manualmente en el dashboard de Render
+        sync: false          
       - key: SUPABASE_URL
         sync: false
       - key: SUPABASE_KEY
