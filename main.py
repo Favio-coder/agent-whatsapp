@@ -1,10 +1,13 @@
 """
-Asistente de IA para Comuneros - Backend Unificado
-Combina la API de conversación + Webhook de WhatsApp (Twilio) en un solo servidor.
+Asistente de IA para Comuneros - Backend Unificado v3
+- API conversacional REST
+- Webhook de WhatsApp (Twilio)
+- Sesiones persistentes en Supabase (tabla 'sessions')
 """
-import uuid
 import os
+import time
 import logging
+import threading
 import requests as http_requests
 
 from fastapi import FastAPI, Form, Response
@@ -14,6 +17,14 @@ from twilio.twiml.messaging_response import MessagingResponse
 
 from gemini_service import analizar_problema, generar_alternativas, interpretar_seleccion
 from queries import buscar_proyectos, crear_proyecto, crear_peticion
+from session_store import (
+    crear_sesion,
+    get_sesion,
+    get_sesion_por_phone,
+    get_o_crear_sesion,
+    guardar_sesion,
+    eliminar_sesion_por_phone,
+)
 
 load_dotenv()
 
@@ -25,7 +36,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Asistente de IA para Comuneros",
     description="API conversacional con integración WhatsApp (Twilio) y Supabase.",
-    version="2.0.0"
+    version="3.0.0"
 )
 
 app.add_middleware(
@@ -36,31 +47,26 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ─── Almacenamiento de sesiones en memoria ────────────────────────────────────
-# { session_id: { "state": str, "metadata": dict } }
-SESSIONS: dict = {}
-# Mapeo phone -> session_id para WhatsApp
-WHATSAPP_SESSIONS: dict = {}
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  HELPERS DE CONVERSACIÓN
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _nueva_sesion(phone_origin: str = "") -> dict:
-    session_id = str(uuid.uuid4())
-    SESSIONS[session_id] = {
-        "state": "START",
-        "metadata": {"phone_origin": phone_origin} if phone_origin else {}
+    session_id = crear_sesion(phone_number=phone_origin)
+    return {
+        "session_id": session_id,
+        "estado": "START",
+        "mensaje": "¡Hola! 👋 Soy tu asistente de IA para la comunidad. ¿En qué necesidad o problema te puedo ayudar hoy?"
     }
-    return {"session_id": session_id, "estado": "START",
-            "mensaje": "¡Hola! 👋 Soy tu asistente de IA para la comunidad. ¿En qué necesidad o problema te puedo ayudar hoy?"}
 
 
-def _sugerir_alternativas(session_id: str, session: dict, problema: str, categoria: str) -> dict:
+def _sugerir_alternativas(session_id: str, state_data: dict, problema: str, categoria: str) -> dict:
     alternativas = generar_alternativas(problema, categoria)
-    session["state"] = "AWAITING_ALTERNATIVE_SELECTION"
-    session["metadata"]["alternativas_propuestas"] = alternativas
+
+    state_data["state"] = "AWAITING_ALTERNATIVE_SELECTION"
+    state_data["metadata"]["alternativas_propuestas"] = alternativas
+    guardar_sesion(session_id, state_data["state"], state_data["metadata"])
 
     alternativas_list = ""
     for i, alt in enumerate(alternativas, start=1):
@@ -83,14 +89,11 @@ def _sugerir_alternativas(session_id: str, session: dict, problema: str, categor
 
 
 def _procesar_mensaje(session_id: str, mensaje: str) -> dict:
-    """Núcleo de la máquina de estados conversacional."""
+    """Núcleo de la máquina de estados conversacional (persistente en Supabase)."""
 
-    if session_id not in SESSIONS:
-        SESSIONS[session_id] = {"state": "START", "metadata": {}}
-
-    session = SESSIONS[session_id]
-    state = session["state"]
-    metadata = session["metadata"]
+    state_data = get_o_crear_sesion(session_id)
+    state    = state_data["state"]
+    metadata = state_data["metadata"]
     phone_origin = metadata.get("phone_origin", "desconocido")
 
     # ── State: START ──────────────────────────────────────────────────────────
@@ -99,14 +102,15 @@ def _procesar_mensaje(session_id: str, mensaje: str) -> dict:
             return {"session_id": session_id, "estado": "START",
                     "mensaje": "Por favor, describe tu problema o necesidad. Ejemplo: 'Mis cuyes están muriendo por la helada'."}
 
-        analisis = analizar_problema(mensaje)
-        categoria         = analisis.get("categoria", "otro").lower().strip()
-        titulo_propuesto  = analisis.get("titulo_propuesto", "Proyecto de Apoyo Comunitario")
+        analisis           = analizar_problema(mensaje)
+        categoria          = analisis.get("categoria", "otro").lower().strip()
+        titulo_propuesto   = analisis.get("titulo_propuesto", "Proyecto de Apoyo Comunitario")
         facultad_propuesta = analisis.get("facultad_propuesta", "Trabajo Social")
-        ods_propuesta     = analisis.get("ods_propuesta", "ODS 17: Alianzas")
+        ods_propuesta      = analisis.get("ods_propuesta", "ODS 17: Alianzas")
 
         metadata.update({
-            "problema": mensaje, "categoria": categoria,
+            "problema": mensaje,
+            "categoria": categoria,
             "titulo_propuesto": titulo_propuesto,
             "facultad_propuesta": facultad_propuesta,
             "ods_propuesta": ods_propuesta
@@ -115,8 +119,9 @@ def _procesar_mensaje(session_id: str, mensaje: str) -> dict:
         proyectos = buscar_proyectos(categoria)
 
         if proyectos:
-            session["state"] = "AWAITING_PROJECT_SELECTION"
+            state_data["state"] = "AWAITING_PROJECT_SELECTION"
             metadata["proyectos_encontrados"] = proyectos
+            guardar_sesion(session_id, state_data["state"], metadata)
 
             proyectos_list = ""
             for i, p in enumerate(proyectos, start=1):
@@ -136,7 +141,8 @@ def _procesar_mensaje(session_id: str, mensaje: str) -> dict:
                 )
             }
         else:
-            return _sugerir_alternativas(session_id, session, mensaje, categoria)
+            guardar_sesion(session_id, state_data["state"], metadata)
+            return _sugerir_alternativas(session_id, state_data, mensaje, categoria)
 
     # ── State: AWAITING_PROJECT_SELECTION ─────────────────────────────────────
     elif state == "AWAITING_PROJECT_SELECTION":
@@ -145,7 +151,7 @@ def _procesar_mensaje(session_id: str, mensaje: str) -> dict:
                     "mensaje": "Por favor, selecciona una opción válida (1, 2…) o responde NINGUNO."}
 
         proyectos = metadata.get("proyectos_encontrados", [])
-        opcion = interpretar_seleccion(mensaje, len(proyectos))
+        opcion    = interpretar_seleccion(mensaje, len(proyectos))
 
         if isinstance(opcion, int) and 1 <= opcion <= len(proyectos):
             proyecto = proyectos[opcion - 1]
@@ -164,12 +170,12 @@ def _procesar_mensaje(session_id: str, mensaje: str) -> dict:
             except Exception as e:
                 respuesta = f"Seleccionaste el proyecto *{proyecto.get('titulo')}*, pero hubo un error al registrar la petición: {e}"
 
-            session["state"] = "START"
-            session["metadata"] = {"phone_origin": phone_origin}
+            guardar_sesion(session_id, "START", {"phone_origin": phone_origin})
             return {"session_id": session_id, "estado": "START", "mensaje": respuesta}
 
         elif opcion == "NINGUNO":
-            return _sugerir_alternativas(session_id, session, metadata["problema"], metadata["categoria"])
+            guardar_sesion(session_id, state_data["state"], metadata)
+            return _sugerir_alternativas(session_id, state_data, metadata["problema"], metadata["categoria"])
 
         else:
             return {"session_id": session_id, "estado": state,
@@ -182,7 +188,7 @@ def _procesar_mensaje(session_id: str, mensaje: str) -> dict:
                     "mensaje": "Por favor, selecciona una propuesta alternativa (1, 2 o 3)."}
 
         alternativas = metadata.get("alternativas_propuestas", [])
-        opcion = interpretar_seleccion(mensaje, len(alternativas))
+        opcion       = interpretar_seleccion(mensaje, len(alternativas))
 
         if isinstance(opcion, int) and 1 <= opcion <= len(alternativas):
             alt = alternativas[opcion - 1]
@@ -205,13 +211,11 @@ def _procesar_mensaje(session_id: str, mensaje: str) -> dict:
             except Exception as e:
                 respuesta = f"Hubo un problema al registrar la propuesta: {e}. Por favor intenta de nuevo."
 
-            session["state"] = "START"
-            session["metadata"] = {"phone_origin": phone_origin}
+            guardar_sesion(session_id, "START", {"phone_origin": phone_origin})
             return {"session_id": session_id, "estado": "START", "mensaje": respuesta}
 
         elif opcion == "NINGUNO":
-            session["state"] = "START"
-            session["metadata"] = {"phone_origin": phone_origin}
+            guardar_sesion(session_id, "START", {"phone_origin": phone_origin})
             return {"session_id": session_id, "estado": "START",
                     "mensaje": "Entendido, no registré ninguna propuesta. ¿En qué otra cosa puedo ayudarte?"}
 
@@ -220,19 +224,18 @@ def _procesar_mensaje(session_id: str, mensaje: str) -> dict:
                     "mensaje": "No entendí tu selección. Responde con 1, 2, 3 o NINGUNO."}
 
     # ── Fallback ──────────────────────────────────────────────────────────────
-    session["state"] = "START"
-    session["metadata"] = {"phone_origin": phone_origin}
+    guardar_sesion(session_id, "START", {"phone_origin": phone_origin})
     return {"session_id": session_id, "estado": "START",
             "mensaje": "Ocurrió un error en el flujo. ¿En qué te puedo ayudar?"}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ENDPOINTS REST (para frontend / pruebas directas)
+#  ENDPOINTS REST
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/")
 def root():
-    return {"status": "online", "mensaje": "Asistente de IA para comuneros - v2.0"}
+    return {"status": "online", "mensaje": "Asistente de IA para comuneros - v3.0"}
 
 
 @app.get("/saludar")
@@ -241,31 +244,30 @@ def saludar(data: dict = None):
     phone_origin = ""
     if data:
         phone_origin = data.get("phone_origin", "")
-    res = _nueva_sesion(phone_origin)
-    return res
+    return _nueva_sesion(phone_origin)
 
 
 @app.post("/analizar")
 def analizar(data: dict):
-    session_id     = data.get("session_id")
-    mensaje        = data.get("mensaje") or data.get("problema", "")
-    phone_origin   = data.get("phone_origin")
+    session_id   = data.get("session_id")
+    mensaje      = data.get("mensaje") or data.get("problema", "")
+    phone_origin = data.get("phone_origin")
 
     if not session_id:
-        session_id = str(uuid.uuid4())
-        SESSIONS[session_id] = {"state": "START", "metadata": {}}
+        # Sin session_id: crear nueva sesión
+        return _nueva_sesion(phone_origin or "")
 
-    if session_id not in SESSIONS:
-        SESSIONS[session_id] = {"state": "START", "metadata": {}}
-
+    # Si phone_origin viene en el request, actualizarlo en la sesión
     if phone_origin:
-        SESSIONS[session_id]["metadata"]["phone_origin"] = phone_origin
+        state_data = get_o_crear_sesion(session_id)
+        state_data["metadata"]["phone_origin"] = phone_origin
+        guardar_sesion(session_id, state_data["state"], state_data["metadata"])
 
     return _procesar_mensaje(session_id, mensaje)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  WEBHOOK WHATSAPP (Twilio) — mismo puerto
+#  WEBHOOK WHATSAPP (Twilio)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _es_saludo(mensaje: str) -> bool:
@@ -279,8 +281,8 @@ def _es_saludo(mensaje: str) -> bool:
     }
     return msg in saludos
 
+
 def _es_fin_conversacion(estado: str, mensaje: str) -> bool:
-    """Detecta si la conversación terminó para limpiar la sesión de WhatsApp."""
     fin_frases = [
         "¿Deseas realizar otra consulta?",
         "¿En qué otra cosa puedo ayudarte?",
@@ -296,26 +298,26 @@ async def whatsapp_webhook(
     WaId: str = Form(None)
 ):
     """Webhook para recibir mensajes de WhatsApp enviados por Twilio."""
-    phone  = From or f"whatsapp:{WaId}"
-    texto  = (Body or "").strip()
-
+    phone = From or f"whatsapp:{WaId}"
+    texto = (Body or "").strip()
     logger.info(f"[WA] De: {phone} | Mensaje: {texto}")
 
     try:
-        # Si no hay sesión o el usuario saluda → nueva sesión
-        if phone not in WHATSAPP_SESSIONS or _es_saludo(texto):
+        # Buscar sesión existente por número de teléfono
+        sesion_existente = get_sesion_por_phone(phone)
+
+        if sesion_existente is None or _es_saludo(texto):
+            # Nueva sesión (crea o sobreescribe la anterior por upsert en phone_number)
             res = _nueva_sesion(phone_origin=phone)
-            WHATSAPP_SESSIONS[phone] = res["session_id"]
             bot_response = res["mensaje"]
         else:
-            res = _procesar_mensaje(WHATSAPP_SESSIONS[phone], texto)
-            # Actualizar session_id si se regeneró
-            WHATSAPP_SESSIONS[phone] = res["session_id"]
+            session_id   = sesion_existente["session_id"]
+            res          = _procesar_mensaje(session_id, texto)
             bot_response = res["mensaje"]
 
             if _es_fin_conversacion(res["estado"], bot_response):
-                logger.info(f"[WA] Sesión terminada para {phone}")
-                del WHATSAPP_SESSIONS[phone]
+                logger.info(f"[WA] Conversación terminada para {phone}")
+                eliminar_sesion_por_phone(phone)
 
     except Exception as e:
         logger.error(f"[WA] Error: {e}")
@@ -335,59 +337,36 @@ async def whatsapp_verify():
 @app.get("/sessions")
 async def list_sessions():
     """Solo para debugging."""
-    return {
-        "api_sessions": list(SESSIONS.keys()),
-        "whatsapp_sessions": list(WHATSAPP_SESSIONS.keys())
-    }
+    from supabase_client import supabase
+    res = supabase.table("sessions").select("session_id, phone_number, state, updated_at").execute()
+    return {"sessions": res.data, "total": len(res.data)}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  HEALTH CHECK + KEEP-ALIVE (Render Free Tier)
+# ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/healthz")
 def health_check():
-    """Endpoint para monitoreo de salud (UptimeRobot, Render, etc.)"""
     return {"status": "healthy", "timestamp": time.time()}
 
 
-import threading
-import time
-import requests
-import os
-
-def keep_alive():
-    """
-    Mantiene la aplicación activa en Render Free Tier.
-    Hace ping a /healthz cada 4 minutos (240 segundos).
-    """
-    # Obtener la URL base de la aplicación
-    # En Render, RENDER_EXTERNAL_URL es la URL pública completa
-    base_url = os.getenv('RENDER_EXTERNAL_URL', 'https://agent-whatsapp-haoq.onrender.com')
-    
-    # También podemos obtener el hostname
-    hostname = os.getenv('RENDER_EXTERNAL_HOSTNAME', 'agent-whatsapp-haoq.onrender.com')
-    
-    # URLs para mantener activo
-    urls_to_ping = [
-        f"{base_url}/healthz",
-        f"{base_url}/whatsapp",  # GET request (devuelve estado)
-        f"https://{hostname}/healthz"
-    ]
-    
+def _keep_alive():
+    """Ping cada 4 min para evitar el cold-start en Render Free."""
+    base_url = os.getenv("RENDER_EXTERNAL_URL", "")
+    if not base_url:
+        return
+    url = f"{base_url}/healthz"
     while True:
-        for url in urls_to_ping:
-            try:
-                response = requests.get(url, timeout=10)
-                if response.status_code == 200:
-                    print(f"✅ Keep-alive ping exitoso: {url}")
-                else:
-                    print(f"⚠️ Ping a {url} respondió con: {response.status_code}")
-            except requests.exceptions.RequestException as e:
-                print(f"❌ Error haciendo ping a {url}: {str(e)}")
-            except Exception as e:
-                print(f"❌ Error inesperado: {str(e)}")
-        
-        # Esperar 4 minutos (menos que el timeout de Render que es 15 min)
+        try:
+            r = http_requests.get(url, timeout=10)
+            logger.info(f"[KeepAlive] {url} → {r.status_code}")
+        except Exception as e:
+            logger.warning(f"[KeepAlive] Error: {e}")
         time.sleep(240)
 
-# Iniciar el thread solo si estamos en Render (opcional)
-if os.getenv('RENDER'):
-    thread = threading.Thread(target=keep_alive, daemon=True)
-    thread.start()
-    print("🔄 Keep-alive thread iniciado")
+
+if os.getenv("RENDER"):
+    t = threading.Thread(target=_keep_alive, daemon=True)
+    t.start()
+    logger.info("🔄 Keep-alive thread iniciado")
