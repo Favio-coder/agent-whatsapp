@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: asistente-comuneros
+    runtime: python
+    repo: https://github.com/TU_USUARIO/TU_REPO   # <-- Cambia esto
+    branch: main
+    plan: free
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false          # Se ingresa manualmente en el dashboard de Render
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
