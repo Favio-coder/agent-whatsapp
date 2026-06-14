@@ -158,7 +158,7 @@ def _procesar_mensaje(session_id: str, mensaje: str) -> dict:
                     f"📋 *{proyecto.get('titulo')}*\n"
                     f"- Carrera: {proyecto.get('facultad')}\n"
                     f"- Contacto: {phone_origin}\n"
-                    f"- Estado: No Atendido\n\n"
+                    f"- Estado: Enviado\n\n"
                     f"Pronto nos comunicamos contigo. ¡Gracias! 🙌\n\n¿Deseas realizar otra consulta?"
                 )
             except Exception as e:
@@ -199,7 +199,7 @@ def _procesar_mensaje(session_id: str, mensaje: str) -> dict:
                     f"- Carrera: {alt['facultad']}\n"
                     f"- ODS: {alt['ods']}\n"
                     f"- Contacto: {phone_origin}\n"
-                    f"- Estado: No Atendido\n\n"
+                    f"- Estado: Enviado\n\n"
                     f"Pronto nos pondremos en contacto contigo. ¡Muchas gracias! 🙌\n\n¿Deseas realizar otra consulta?"
                 )
             except Exception as e:
