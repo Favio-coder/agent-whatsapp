@@ -339,3 +339,55 @@ async def list_sessions():
         "api_sessions": list(SESSIONS.keys()),
         "whatsapp_sessions": list(WHATSAPP_SESSIONS.keys())
     }
+
+@app.get("/healthz")
+def health_check():
+    """Endpoint para monitoreo de salud (UptimeRobot, Render, etc.)"""
+    return {"status": "healthy", "timestamp": time.time()}
+
+
+import threading
+import time
+import requests
+import os
+
+def keep_alive():
+    """
+    Mantiene la aplicación activa en Render Free Tier.
+    Hace ping a /healthz cada 4 minutos (240 segundos).
+    """
+    # Obtener la URL base de la aplicación
+    # En Render, RENDER_EXTERNAL_URL es la URL pública completa
+    base_url = os.getenv('RENDER_EXTERNAL_URL', 'https://agent-whatsapp-haoq.onrender.com')
+    
+    # También podemos obtener el hostname
+    hostname = os.getenv('RENDER_EXTERNAL_HOSTNAME', 'agent-whatsapp-haoq.onrender.com')
+    
+    # URLs para mantener activo
+    urls_to_ping = [
+        f"{base_url}/healthz",
+        f"{base_url}/whatsapp",  # GET request (devuelve estado)
+        f"https://{hostname}/healthz"
+    ]
+    
+    while True:
+        for url in urls_to_ping:
+            try:
+                response = requests.get(url, timeout=10)
+                if response.status_code == 200:
+                    print(f"✅ Keep-alive ping exitoso: {url}")
+                else:
+                    print(f"⚠️ Ping a {url} respondió con: {response.status_code}")
+            except requests.exceptions.RequestException as e:
+                print(f"❌ Error haciendo ping a {url}: {str(e)}")
+            except Exception as e:
+                print(f"❌ Error inesperado: {str(e)}")
+        
+        # Esperar 4 minutos (menos que el timeout de Render que es 15 min)
+        time.sleep(240)
+
+# Iniciar el thread solo si estamos en Render (opcional)
+if os.getenv('RENDER'):
+    thread = threading.Thread(target=keep_alive, daemon=True)
+    thread.start()
+    print("🔄 Keep-alive thread iniciado")
